@@ -30,7 +30,16 @@
 ;; for listing how much time was spent on what task; and for hour
 ;; reporting a summary of when I started and finished at office, and
 ;; how much of that time was spent on work and how much on pauses, and
-;; finally a difference to the basic work day lenght.
+;; finally a difference to the basic work day length for flexi time
+;; saldo.
+;;
+;; If there is no journal file for certain date, it means it was a day
+;; off - holiday, weekend etc.
+;;
+;; If there's an empty journal file (or more specifically a file
+;; without a `org-dblock-write:timetrack-journals-date' table), it
+;; means that that day was taken off the flexi saldo and should
+;; decrease the saldo by basic work days' worth.
 ;;
 ;; This file implements functions that help me to:
 ;;
@@ -64,19 +73,15 @@
 ;; but ultimately I decided to write my own to better accommodate
 ;; with my personal journalling practice.
 
-;; TODO:
-;; - error checking in general. Specifically e.g. empty
-;;   timetrack-journals-date in monthly table
-;; - `org-table-recalculate' gets stuck if monthly table has now rows
-;;   for any date (i.e. you try to create a summary of month that has
-;;   no journal entries).
-
 ;;; Code:
 
 (provide 'timetrack-journals)
 
 (defvar timetrack-journals-journal-dir "~/Work/journal/"
   "Where the journal files (one per day) are stored.")
+
+(defvar timetrack-journals-workday-len (floor (* 7.5 60 60))
+  "Length of a normal day at work excluding pauses. In seconds.")
 
 ;;;###autoload
 (defun timetrack-journals-days-log (prefix)
@@ -129,32 +134,48 @@ an integer representation of the time) as conses."
              for end in (sort ends #'<)
              collect (cons beg end))))
 
+(defmacro timetrack-journals--buf-to-string (&rest body)
+  "Run BODY (code inserting stuff in a buffer) in a temporary
+buffer and return the buffer's contents as a string."
+  `(with-temp-buffer
+     ,@body
+     (buffer-substring-no-properties (point-min) (point-max))))
+
+(defun timetrack-journals--insert-org-date-by-filename (&optional filename)
+  "Insert org time stamp based on FILENAME or if that is not
+given, the name of the file of the buffer being currently
+visited."
+  ;; Assume filename's date is always of format YYYY-MM-DD
+  (let ((fn-date (substring (or filename (file-name-nondirectory (buffer-file-name))) 0 10)))
+    (org-insert-time-stamp
+     ;; Parsing just the date part gives lisp date with various
+     ;; components as nil. Convert them to 0 first, otherwise
+     ;; `encode-time' fails.
+     (encode-time (mapcar (lambda (x) (or x 0))
+                          (parse-time-string fn-date))))))
+
+(defun timetrack-journals--lisp-time-to-hh-mm (time)
+  "Convert TIME's (a list like that returned by `decode-time')
+hour and minute parts to [H]H:MM format."
+  (format "%d:%02d" (nth 2 time) (nth 1 time)))
+
 (defun org-dblock-write:timetrack-journals-date (params)
   "Fill the timetrack-journals-date type org blocks with an org-table
 telling date, start time, end time, elapsed worktime, time spent
 at breaks and day's collected flexi time (negative or positive)."
   (declare (ignore params))
-  (insert "| ")
-  (org-insert-time-stamp
-   ;; Parsing just the date part gives lisp date with various
-   ;; components as nil. Convert them to 0 first, otherwise
-   ;; `encode-time' fails.
-   (encode-time (mapcar (lambda (x) (or x 0))
-                        (parse-time-string
-                         ;; Assume filename's date is always of format
-                         ;; YYYY-MM-DD
-                         (substring (file-name-nondirectory (buffer-file-name)) 0 10)))))
-  (cl-flet ((lisp-time-to-hh-mm (time)
-                                (format "%d:%02d" (nth 2 time) (nth 1 time))))
-    (let* ((continuous-time-entries (timetrack-journals-collect-org-clock-entries))
-           (day-start-epoch (car (cl-first continuous-time-entries)))
-           (day-start (decode-time day-start-epoch))
-           (day-start-hh-mm-str (lisp-time-to-hh-mm day-start))
-           (day-end-epoch (cdar (last continuous-time-entries)))
-           (day-end (decode-time day-end-epoch))
-           (day-end-hh-mm-str (lisp-time-to-hh-mm day-end))
-           (pause-sum-in-sec 0)
-           pause-start pause-end)
+  (let* ((continuous-time-entries (timetrack-journals-collect-org-clock-entries))
+         (day-start-epoch (car (cl-first continuous-time-entries)))
+         (day-start (decode-time day-start-epoch))
+         (day-start-hh-mm-str (timetrack-journals--lisp-time-to-hh-mm day-start))
+         (day-end-epoch (cdar (last continuous-time-entries)))
+         (day-end (decode-time day-end-epoch))
+         (day-end-hh-mm-str (timetrack-journals--lisp-time-to-hh-mm day-end))
+         (pause-sum-in-sec 0)
+         pause-start pause-end)
+    (when continuous-time-entries
+      (insert "| ")
+      (timetrack-journals--insert-org-date-by-filename)
       (while continuous-time-entries
         (setq pause-start (cdr (pop continuous-time-entries)))
         (setq pause-end (car (cl-first continuous-time-entries)))
@@ -162,15 +183,17 @@ at breaks and day's collected flexi time (negative or positive)."
           (setq pause-sum-in-sec (+ (- pause-end pause-start) pause-sum-in-sec))))
       ;; `decode-time' called with amount of seconds that's less than
       ;; 24hrs and with timezone 0 gives us a date in 1970's but we
-      ;; can just pick the hour and minute part (see
-      ;; `lisp-time-to-hh-mm'). SO DON'T WORK ROUND THE CLOCK!
-      (let* ((pause-sum-hh-mm-str (lisp-time-to-hh-mm (decode-time pause-sum-in-sec 0)))
+      ;; can just pick the hour and minute part. SO DON'T WORK ROUND
+      ;; THE CLOCK!
+      (let* ((pause-sum-hh-mm-str (timetrack-journals--lisp-time-to-hh-mm
+                                   (decode-time pause-sum-in-sec 0)))
              (wrk-len-epoch (- day-end-epoch day-start-epoch pause-sum-in-sec))
-             (wrk-len-hh-mm-str (lisp-time-to-hh-mm (decode-time wrk-len-epoch 0)))
+             (wrk-len-hh-mm-str (timetrack-journals--lisp-time-to-hh-mm
+                                 (decode-time wrk-len-epoch 0)))
              ;; `decode-time' trick only works with positive
              ;; times. Make negative timestrings "by hand"
-             (cumulative-hh-mm-str (let* ((time (- wrk-len-epoch (* 15 30 60)))
-                                          (time-hh-mm (lisp-time-to-hh-mm
+             (cumulative-hh-mm-str (let* ((time (- wrk-len-epoch timetrack-journals-workday-len))
+                                          (time-hh-mm (timetrack-journals--lisp-time-to-hh-mm
                                                        (decode-time (abs time) 0))))
                                      (if (< time 0)
                                          (concat "-" time-hh-mm)
@@ -178,8 +201,8 @@ at breaks and day's collected flexi time (negative or positive)."
         (insert " | ") (insert day-start-hh-mm-str) (insert " | ") (insert day-end-hh-mm-str)
         (insert " | ") (insert wrk-len-hh-mm-str)
         (insert " | ") (insert pause-sum-hh-mm-str)
-        (insert " | ") (insert cumulative-hh-mm-str))))
-  (insert " |"))
+        (insert " | ") (insert cumulative-hh-mm-str))
+      (insert " |"))))
 
 (defun org-dblock-write:timetrack-journals-month (params)
   "Collect timetrack-journals-date rows (see
@@ -190,14 +213,10 @@ org-table. Sum the values."
   (declare (ignore params))
   ;; Assume filename is always summary-YYYY-MM.org and individual
   ;; journals are YYYY-MM-DD.org
-  (insert "| date    | start | end | work | break | flexi |
-")
-  (insert "|---------+-------+-----+------+-------+-------|
-")
-  (insert "| *total* |       |     |      |       |       |
-")
-  (insert "|---------+-------+-----+------+-------+-------|
-")
+  (insert "| date    | start | end | work | break | flexi |\n")
+  (insert "|---------+-------+-----+------+-------+-------|\n")
+  (insert "| *total* |       |     |      |       |       |\n")
+  (insert "|---------+-------+-----+------+-------+-------|\n")
   (let* ((yyyy-mm (substring (file-name-nondirectory (buffer-file-name)) 8 15))
          (journal-fnames (directory-files
                           timetrack-journals-journal-dir nil
@@ -206,12 +225,30 @@ org-table. Sum the values."
     (dolist (journal-fname journal-fnames)
       (with-current-buffer (find-file-noselect journal-fname)
         (save-excursion
+          ;; If file is found and contains the timetrack-journals-date
+          ;; table, use that data. If file is found but doesn't
+          ;; contain the timetrack-journals-date table, mark that day
+          ;; as having taken full day off the flexi time. If file is
+          ;; not found at all, it's assumed it's a free day.
           (goto-char (point-min))
-          (re-search-forward (rx bol "#+BEGIN:" (1+ whitespace) "timetrack-journals-date") nil t)
-          (next-line)
-          ;; TODO: assertions that line is really an org table line
-          ;; with correct amount of lines
-          (push (thing-at-point 'line t) rows))))
+          (push (or (when (re-search-forward (rx bol "#+BEGIN:" (1+ whitespace)
+                                                 "timetrack-journals-date")
+                                             nil t)
+                      (next-line)
+                      (when (org-at-table-p)
+                        ;; Could assert that org table line contains
+                        ;; right amount of cells by calling
+                        ;; e.g. `org-table-analyze' but maybe
+                        ;; overkill for now.
+                        (thing-at-point 'line t)))
+                    (concat "| " (timetrack-journals--buf-to-string
+                                  (timetrack-journals--insert-org-date-by-filename journal-fname))
+                            ;; | start | end | work | break | flexi |
+                            "  |       |     | 0:00 |  0:00 | -"
+                            (timetrack-journals--lisp-time-to-hh-mm
+                             (decode-time timetrack-journals-workday-len 0))
+                            " |\n"))
+                rows))))
     (dolist (row (reverse rows))
       (insert row))
     ;; Last row contains newline so no explicit one here. Last, apply
@@ -219,7 +256,11 @@ org-table. Sum the values."
     (insert "#+TBLFM: @2$4=vsum(@II..@III);U::@2$5=vsum(@II..@III);U::@2$6=vsum(@II..@III);U")
     (next-line -2)
     (org-table-align)
-    (org-table-recalculate)))
+    (when rows
+      ;; `org-table-recalculate' gets stuck if monthly table has no
+      ;;  rows (i.e. you try to create a summary of month that has no
+      ;;  journal entries), hence conditional execution.
+      (org-table-recalculate))))
 
 ;;;###autoload
 (defun timetrack-journals-months-log (prefix)
